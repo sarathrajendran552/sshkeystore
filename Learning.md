@@ -1,0 +1,321 @@
+# sshkeystore — Learning Notes
+
+This file records how `sshkeystore` was built, how to run it, how it was
+verified, and the important details discovered along the way.
+
+## Goal
+
+Build a small Rust daemon that:
+
+- registers a virtual FIDO2 HID device through Linux UHID;
+- speaks CTAPHID/CTAP2 to `libfido2` / OpenSSH;
+- supports `ssh-keygen -t ed25519-sk`;
+- asks for confirmation through `pinentry`;
+- stores the generated key in SQLite;
+- logs every key creation to the terminal.
+
+The reference projects were `../bouncer` and `../fidorium`. Only the minimum
+needed pieces were reimplemented here.
+
+## Project layout
+
+```text
+sshkeystore/
+├── Cargo.toml
+├── Cargo.lock
+└── src/
+    ├── main.rs                 # CLI parsing, logging, runtime startup
+    ├── config.rs               # database path and pinentry options
+    ├── keys.rs                 # Ed25519 key generation/signing, COSE encoding
+    ├── store.rs                # SQLite credential storage
+    ├── up.rs                   # pinentry confirmation + CTAPHID KEEPALIVE
+    ├── hid/
+    │   ├── mod.rs
+    │   ├── device.rs           # /dev/uhid registration
+    │   ├── report.rs           # FIDO HID report descriptor
+    │   └── transport.rs        # UHID read/write threads
+    ├── ctaphid/
+    │   ├── mod.rs              # CTAPHID loop, dispatch, INIT, PING, CANCEL
+    │   ├── channel.rs          # CID allocation and message reassembly
+    │   ├── packet.rs           # 64-byte packet parsing/encoding
+    │   └── types.rs            # CTAPHID commands and constants
+    └── ctap2/
+        ├── mod.rs              # CTAP2 command dispatch
+        ├── types.rs            # MakeCredential/GetAssertion request parsing
+        ├── get_info.rs         # authenticatorGetInfo
+        ├── make_credential.rs  # key creation and SQLite insert
+        ├── get_assertion.rs    # credential lookup and signing
+        ├── authenticator_data.rs
+        └── attestation.rs      # packed self-attestation
+```
+
+## Creation process
+
+1. **Started from the working reference implementations.**
+   `fidorium` already had a functioning UHID transport, CTAPHID framing,
+   channel handling, KEEPALIVE logic, and pinentry integration. Those parts
+   were copied/adapted. `bouncer` supplied the SQLite credential-store pattern.
+
+2. **Replaced TPM ownership of private keys with SQLite.**
+   `fidorium` stores TPM-wrapped keys. Here the private key is just a 32-byte
+   Ed25519 seed stored in SQLite. The database file is created with mode
+   `0600`.
+
+3. **Added Ed25519 instead of P-256.**
+   OpenSSH requests COSE algorithm `-8` (EdDSA) for
+   `ssh-keygen -t ed25519-sk`. The daemon therefore uses `ed25519-dalek` and
+   returns an OKP COSE key:
+
+   ```text
+   { 1: 1,      # kty = OKP
+     3: -8,     # alg = EdDSA
+    -1: 6,      # crv = Ed25519
+    -2: <32-byte public key> }
+   ```
+
+   `-19` is also accepted as an alias during enrollment because some
+   authenticators advertise it, but OpenSSH currently requests `-8`.
+
+4. **Implemented only the CTAP2 commands OpenSSH needs.**
+   - `authenticatorGetInfo` (`0x04`)
+   - `authenticatorMakeCredential` (`0x01`)
+   - `authenticatorGetAssertion` (`0x02`)
+
+   CTAPHID `INIT`, `PING`, `WINK`, `CANCEL`, and `KEEPALIVE` are also handled.
+
+5. **Used pinentry as the user-presence gate.**
+   A confirmation dialog is shown for both enrollment and signing. While the
+   dialog is open, `KEEPALIVE` packets are sent every 100 ms so libfido2 and
+   Firefox/OpenSSH do not abort the operation.
+
+6. **Used packed self-attestation.**
+   During enrollment the daemon signs `authData || clientDataHash` with the new
+   Ed25519 credential key. `libfido2` calls `fido_cred_verify_self()` when the
+   attestation format is `packed`, so this signature must be correct.
+
+## How to run
+
+Build:
+
+```bash
+cd /home/user/playground/pkitowebauthn/sshkeystore
+cargo build --release
+```
+
+Run the daemon in a terminal:
+
+```bash
+./target/release/sshkeystore
+```
+
+Then, from another terminal:
+
+```bash
+ssh-keygen -t ed25519-sk -f ~/.ssh/bouncer_key
+```
+
+Expected behaviour:
+
+1. `ssh-keygen` discovers the virtual FIDO2 device.
+2. `pinentry` opens with a "Confirm" dialog.
+3. Confirming creates the key.
+4. The daemon prints a line such as:
+
+   ```text
+   KEY CREATED (stored in SQLite) rp_id=ssh: account=openssh credential_id=... alg=-8 discoverable=false
+   ```
+
+5. `~/.ssh/bouncer_key` and `~/.ssh/bouncer_key.pub` are written by OpenSSH.
+
+Signing also works:
+
+```bash
+ssh-keygen -Y sign -f ~/.ssh/bouncer_key -n file ~/some/file
+```
+
+## Options
+
+```bash
+sshkeystore --help
+```
+
+Useful flags:
+
+- `--db PATH` — override the SQLite database path.
+- `--pinentry BIN` — choose a pinentry binary
+  (e.g. `pinentry-curses`, `pinentry-gnome3`, or a test script).
+- `-v` / `-vv` — more logging (`debug` / `trace`).
+
+Default database path on Linux:
+
+```text
+~/.local/share/sshkeystore/sshkeystore.sqlite
+```
+
+The database and its WAL files are created on first start. The database file
+is set to mode `0600`.
+
+## SQLite schema
+
+```sql
+CREATE TABLE credentials (
+    credential_id BLOB PRIMARY KEY NOT NULL,
+    rp_id         TEXT NOT NULL,
+    rp_id_hash    BLOB NOT NULL,
+    user_id       BLOB NOT NULL,
+    user_name     TEXT,
+    user_display  TEXT,
+    alg           INTEGER NOT NULL,
+    private_key   BLOB NOT NULL,
+    public_key    BLOB NOT NULL,
+    sign_count    INTEGER NOT NULL DEFAULT 0,
+    discoverable  INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL
+);
+```
+
+`private_key` is the raw 32-byte Ed25519 seed. `public_key` is the 32-byte
+Ed25519 public key. `rp_id` is `ssh:` for OpenSSH; `user_name` and
+`user_display` are both `openssh` by default.
+
+Inspect it with:
+
+```bash
+sqlite3 ~/.local/share/sshkeystore/sshkeystore.sqlite \
+  'select rp_id, user_name, alg, sign_count, hex(credential_id) from credentials;'
+```
+
+## Permissions
+
+The daemon needs read/write access to `/dev/uhid`. On this machine:
+
+```text
+crw-rw---- root plugdev /dev/uhid
+```
+
+The user must be in the `plugdev` group. If not, either add the user to the
+group or install a udev rule granting access. The created `/dev/hidrawN`
+device is what `libfido2` and OpenSSH actually use.
+
+## End-to-end verification performed
+
+A fake pinentry was used to auto-confirm prompts during automated testing:
+
+```bash
+cat > /tmp/fake-pinentry <<'PY'
+#!/usr/bin/env python3
+import sys
+print("OK", flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    cmd = line.split(" ", 1)[0].upper()
+    if cmd == "BYE":
+        print("OK", flush=True)
+        break
+    print("OK", flush=True)
+PY
+chmod +x /tmp/fake-pinentry
+```
+
+Daemon:
+
+```bash
+./target/debug/sshkeystore \
+  --db /tmp/sshkeystore-final/keys.sqlite \
+  --pinentry /tmp/fake-pinentry
+```
+
+Device detection:
+
+```bash
+fido2-token -L
+# /dev/hidraw0: vendor=0x1209, product=0x5353 ( sshkeystore FIDO2)
+```
+
+Enrollment and signing:
+
+```bash
+ssh-keygen -t ed25519-sk -f /tmp/sshkeystore-final/bouncer_key -N ''
+printf 'sign me\n' > /tmp/sshkeystore-final/msg
+ssh-keygen -Y sign -f /tmp/sshkeystore-final/bouncer_key \
+  -n test /tmp/sshkeystore-final/msg
+```
+
+Both completed successfully, and SQLite contained:
+
+```text
+('ssh:', 'openssh', -8, 1, '610BB855...C662A')
+```
+
+The signature counter incremented after `GetAssertion`.
+
+## Problems encountered and fixes
+
+### 1. `libfido2` rejected `GetInfo` as “invalid cbor”
+
+The first version advertised the CTAP 2.1 `algorithms` field (key `10`) even
+though the device only claimed `FIDO_2_0`. The installed `libfido2` did not
+accept that combination:
+
+```text
+ctap_check_cbor: invalid cbor
+decode_algorithm: ...
+fido_dev_open_rx: falling back to u2f
+```
+
+Fix: removed key `10` from the `GetInfo` response. A CTAP 2.0 device only
+needs keys 1–5.
+
+### 2. `GetAssertion` failed with “invalid format”
+
+The assertion response’s credential descriptor was encoded as:
+
+```cbor
+{"type": "public-key", "id": ...}
+```
+
+CTAP2 requires canonical CBOR, where shorter text keys come first. The correct
+order is:
+
+```cbor
+{"id": ..., "type": "public-key"}
+```
+
+`libfido2`'s `cbor_decode_cred_id()` enforced this ordering. After swapping
+the keys, `ssh-keygen -Y sign` worked.
+
+### 3. UHID report-ID byte
+
+Linux hidraw may prepend a `0x00` report-ID byte. The transport strips it only
+when the report is 65 bytes long and starts with zero.
+
+### 4. Reader/writer deadlock avoidance
+
+The UHID reader runs in one thread and a separate writer thread sends
+responses. A single blocking reader that also writes can deadlock while the
+host waits for a reply.
+
+### 5. KEEPALIVE during pinentry
+
+Hosts abort FIDO operations that appear silent. KEEPALIVE packets are sent
+every 100 ms while pinentry is open and while the response is being prepared.
+
+## Current limitations / notes
+
+- Only Ed25519 (`ed25519-sk`, COSE `-8`) is supported. `ecdsa-sk` (P-256)
+  is not implemented.
+- Private keys are stored unencrypted in SQLite. The database is mode `0600`,
+  but anyone who can read the file can use the keys. This was chosen for a
+  basic implementation.
+- There is no client PIN, user verification, credential management, or
+  credProtect. `ssh-keygen -O resident` may be rejected because the device
+  does not advertise credProtect.
+- The `rk` GetInfo option is reported as supported, and discoverable
+  credentials are stored and can be returned by `GetAssertion`, but the full
+  resident-key/credential-management feature set is not implemented.
+- User presence is a simple pinentry Yes/Cancel dialog, not a touch sensor.
+- Linux only, as requested.
+- The daemon expects to run in a user session with access to `/dev/uhid` and
+  a usable pinentry (the terminal/curses variant works well).
