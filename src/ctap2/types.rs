@@ -3,9 +3,13 @@ use ciborium::value::Value;
 pub const CMD_MAKE_CREDENTIAL: u8 = 0x01;
 pub const CMD_GET_ASSERTION: u8 = 0x02;
 pub const CMD_GET_INFO: u8 = 0x04;
+pub const CMD_CLIENT_PIN: u8 = 0x06;
+pub const CMD_CREDENTIAL_MANAGEMENT: u8 = 0x0A;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Ctap2Error {
+    #[error("invalid command")]
+    InvalidCommand,
     #[error("missing parameter")]
     MissingParameter,
     #[error("unsupported algorithm")]
@@ -18,6 +22,8 @@ pub enum Ctap2Error {
     UserActionTimeout,
     #[error("keepalive cancel")]
     KeepaliveCancel,
+    #[error("PIN authentication invalid")]
+    PinAuthInvalid,
     #[error("no credentials")]
     NoCredentials,
     #[error("invalid length")]
@@ -33,12 +39,14 @@ pub enum Ctap2Error {
 impl Ctap2Error {
     pub fn status_byte(&self) -> u8 {
         match self {
+            Self::InvalidCommand => 0x01,
             Self::MissingParameter => 0x14,
             Self::UnsupportedAlgorithm => 0x26,
             Self::CredentialExcluded => 0x19,
             Self::OperationDenied => 0x27,
             Self::UserActionTimeout => 0x2A,
             Self::KeepaliveCancel => 0x2D,
+            Self::PinAuthInvalid => 0x33,
             Self::NoCredentials => 0x2E,
             Self::InvalidLength => 0x03,
             Self::Cbor(_) => 0x11,
@@ -56,6 +64,7 @@ pub struct MakeCredentialRequest {
     pub user_name: Option<String>,
     pub user_display: Option<String>,
     pub resident_key: bool,
+    pub cred_prot: Option<u8>,
     pub exclude_list: Vec<Vec<u8>>,
     pub selected_alg: Option<i64>,
 }
@@ -200,6 +209,13 @@ impl TryFrom<&[u8]> for MakeCredentialRequest {
             .and_then(as_bool)
             .unwrap_or(false);
 
+        let cred_prot = get(&map, 6).and_then(as_map).and_then(|extensions| {
+            get_str(extensions, "credProtect").and_then(|value| match value {
+                Value::Integer(level) => u8::try_from(*level).ok(),
+                _ => None,
+            })
+        });
+
         Ok(Self {
             client_data_hash,
             rp_id,
@@ -208,6 +224,7 @@ impl TryFrom<&[u8]> for MakeCredentialRequest {
             user_name,
             user_display,
             resident_key,
+            cred_prot,
             exclude_list,
             selected_alg,
         })

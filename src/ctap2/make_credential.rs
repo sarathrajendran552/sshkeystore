@@ -66,7 +66,13 @@ pub async fn handle_make_credential(
     let mut credential_id = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut credential_id);
 
-    let auth_data = build_make_cred_auth_data(&rp_id_hash, &credential_id, &key.public(), alg);
+    let auth_data = build_make_cred_auth_data(
+        &rp_id_hash,
+        &credential_id,
+        &key.public(),
+        alg,
+        req.cred_prot,
+    );
     let mut to_sign = auth_data.clone();
     to_sign.extend_from_slice(&req.client_data_hash);
     let signature = key.sign(&to_sign);
@@ -89,6 +95,7 @@ pub async fn handle_make_credential(
         public_key: key.public().to_vec(),
         sign_count: 0,
         discoverable: req.resident_key,
+        cred_prot: req.cred_prot.unwrap_or(0),
         created_at,
     };
 
@@ -104,6 +111,7 @@ pub async fn handle_make_credential(
         credential_id = %hex(&record.credential_id),
         alg = alg,
         discoverable = record.discoverable,
+        cred_prot = record.cred_prot,
         "KEY CREATED (stored in SQLite)"
     );
 

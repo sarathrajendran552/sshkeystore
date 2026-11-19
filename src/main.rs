@@ -37,6 +37,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let store = Arc::new(std::sync::Mutex::new(store::CredentialStore::open(
         &db_path,
     )?));
+    let ctap_state = Arc::new(std::sync::Mutex::new(ctap2::CtapState::default()));
 
     tracing::info!(db = %db_path.display(), "sshkeystore starting");
     tracing::info!("virtual FIDO2 UHID device will be registered on /dev/uhid");
@@ -47,6 +48,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         transport.incoming_rx,
         transport.outgoing_tx,
         store,
+        ctap_state,
         cfg.pinentry.clone(),
     )
     .await;

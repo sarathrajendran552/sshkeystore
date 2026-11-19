@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local SQLite databases and WAL sidecars
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Logs and test/coverage artifacts
+*.log
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.*
+
+# Local environment files
+.env
+.env.*
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Keys downloaded by ssh-keygen -K in the working tree
+/id_ed25519_sk_rk*

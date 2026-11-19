@@ -11,11 +11,15 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 ciborium = "0.2"
+cipher = "0.4"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 ed25519-dalek = "2"
 pinentry = "0.5"
+p256 = { version = "0.13", features = ["ecdh"] }
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"

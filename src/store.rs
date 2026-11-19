@@ -14,6 +14,7 @@ pub struct CredentialRecord {
     pub public_key: Vec<u8>,
     pub sign_count: u32,
     pub discoverable: bool,
+    pub cred_prot: u8,
     pub created_at: u64,
 }
 
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS credentials (
     public_key    BLOB NOT NULL,
     sign_count    INTEGER NOT NULL DEFAULT 0,
     discoverable  INTEGER NOT NULL DEFAULT 0,
+    cred_prot     INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_credentials_rp_hash
@@ -62,6 +64,11 @@ impl CredentialStore {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(CREATE_SCHEMA)?;
+        // Migration for databases created before resident-key support.
+        let _ = conn.execute(
+            "ALTER TABLE credentials ADD COLUMN cred_prot INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         #[cfg(unix)]
         {
@@ -76,8 +83,8 @@ impl CredentialStore {
         self.conn.execute(
             "INSERT INTO credentials (
                 credential_id, rp_id, rp_id_hash, user_id, user_name, user_display,
-                alg, private_key, public_key, sign_count, discoverable, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                alg, private_key, public_key, sign_count, discoverable, cred_prot, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 record.credential_id,
                 record.rp_id,
@@ -90,6 +97,7 @@ impl CredentialStore {
                 record.public_key,
                 record.sign_count as i64,
                 record.discoverable as i64,
+                record.cred_prot as i64,
                 record.created_at as i64,
             ],
         )?;
@@ -101,7 +109,7 @@ impl CredentialStore {
             .conn
             .query_row(
                 "SELECT credential_id, rp_id, rp_id_hash, user_id, user_name, user_display,
-                        alg, private_key, public_key, sign_count, discoverable, created_at
+                        alg, private_key, public_key, sign_count, discoverable, cred_prot, created_at
                  FROM credentials WHERE credential_id = ?1",
                 params![credential_id],
                 row_to_record,
@@ -113,7 +121,7 @@ impl CredentialStore {
     pub fn get_by_rp_hash(&self, rp_id_hash: &[u8]) -> Result<Vec<CredentialRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT credential_id, rp_id, rp_id_hash, user_id, user_name, user_display,
-                    alg, private_key, public_key, sign_count, discoverable, created_at
+                    alg, private_key, public_key, sign_count, discoverable, cred_prot, created_at
              FROM credentials
              WHERE rp_id_hash = ?1
              ORDER BY created_at DESC",
@@ -124,6 +132,30 @@ impl CredentialStore {
             records.push(row?);
         }
         Ok(records)
+    }
+
+    pub fn count_discoverable(&self) -> Result<u64, StoreError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM credentials WHERE discoverable = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    pub fn discoverable_rps(&self) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT rp_id, rp_id_hash
+             FROM credentials
+             WHERE discoverable = 1
+             ORDER BY rp_id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut rps = Vec::new();
+        for row in rows {
+            rps.push(row?);
+        }
+        Ok(rps)
     }
 
     pub fn increment_sign_count(&mut self, credential_id: &[u8]) -> Result<u32, StoreError> {
@@ -162,7 +194,8 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<CredentialRecord> {
         public_key: row.get(8)?,
         sign_count: row.get::<_, i64>(9)? as u32,
         discoverable: row.get::<_, i64>(10)? != 0,
-        created_at: row.get::<_, i64>(11)? as u64,
+        cred_prot: row.get::<_, i64>(11)? as u8,
+        created_at: row.get::<_, i64>(12)? as u64,
     })
 }
 

@@ -23,6 +23,7 @@ pub async fn run(
     mut incoming_rx: mpsc::Receiver<[u8; 64]>,
     outgoing_tx: mpsc::Sender<[u8; 64]>,
     store: Arc<Mutex<CredentialStore>>,
+    ctap_state: Arc<Mutex<crate::ctap2::CtapState>>,
     pinentry_bin: String,
 ) -> anyhow::Result<()> {
     let mut manager = ChannelManager::new();
@@ -52,15 +53,22 @@ pub async fn run(
                 cancel.store(false, Ordering::Relaxed);
                 let tx = outgoing_tx.clone();
                 let store = Arc::clone(&store);
+                let ctap_state = Arc::clone(&ctap_state);
                 let cancel = Arc::clone(&cancel);
                 let busy = Arc::clone(&cbor_busy);
                 let pinentry_bin = pinentry_bin.clone();
                 let cid = message.cid;
 
                 tokio::spawn(async move {
-                    let response =
-                        crate::ctap2::dispatch_cbor(message, &store, &pinentry_bin, &tx, &cancel)
-                            .await;
+                    let response = crate::ctap2::dispatch_cbor(
+                        message,
+                        &store,
+                        &pinentry_bin,
+                        &tx,
+                        &cancel,
+                        &ctap_state,
+                    )
+                    .await;
                     tracing::trace!(len = response.len(), head = %response.iter().take(24).map(|b| format!("{b:02x}")).collect::<String>(), "CTAP2 response");
                     for packet in encode_response(cid, CMD_CBOR, &response) {
                         tx.send(packet).await.ok();
